@@ -92,6 +92,9 @@
         "                <method name=\"ResetKnown\"/>\n"               \
         "                <method name=\"ResetAll\"/>\n"                 \
         "                <method name=\"Exit\"/>\n"                     \
+        "                <method name=\"Sleep\">\n"                     \
+        "                        <arg name=\"sleep\" type=\"b\" direction=\"in\"/>\n" \
+        "                </method>\n"                                   \
         "                <property name=\"RTTimeUSecMax\" type=\"x\" access=\"read\"/>\n" \
         "                <property name=\"MaxRealtimePriority\" type=\"i\" access=\"read\"/>\n" \
         "                <property name=\"MinNiceLevel\" type=\"i\" access=\"read\"/>\n" \
@@ -227,7 +230,7 @@ static unsigned n_users = 0;
 static unsigned n_total_processes = 0;
 static unsigned n_total_threads = 0;
 static const char *proc = NULL;
-static int quit_fd = -1, canary_fd = -1;
+static int quit_fd = -1, canary_fd = -1, sleep_fd = -1;
 static pthread_t canary_thread_id = 0, watchdog_thread_id = 0;
 static volatile uint32_t refuse_until = 0;
 
@@ -1313,6 +1316,21 @@ static int handle_dbus_prop_get(const char* property, DBusMessage *r) {
         return 0;
 }
 
+static int sleep_threads(bool sleep) {
+        static bool sleep_state = false;
+        int r;
+
+        if (sleep == sleep_state)
+                return 0;
+
+        r = eventfd_write(sleep_fd, 1);
+        if (r < 0)
+                return r;
+
+        sleep_state = sleep;
+        return 0;
+}
+
 static DBusHandlerResult dbus_handler(DBusConnection *c, DBusMessage *m, void *userdata) {
         DBusError error;
         DBusMessage *r = NULL;
@@ -1447,6 +1465,36 @@ static DBusHandlerResult dbus_handler(DBusConnection *c, DBusMessage *m, void *u
 
                 dbus_connection_close(c);
 
+        } else if (dbus_message_is_method_call(m, "org.freedesktop.RealtimeKit1", "Sleep")) {
+                int ret;
+                bool sleep = false;
+
+                ret = dbus_message_get_args(m, &error,
+                                            DBUS_TYPE_BOOLEAN, &sleep,
+                                            DBUS_TYPE_INVALID);
+
+                if (!ret) {
+                        syslog(LOG_DEBUG, "Failed to parse Sleep() method call: %s\n", error.message);
+                        assert_se(r = dbus_message_new_error(m, error.name, error.message));
+
+                        goto finish;
+                }
+
+                ret = sleep_threads(sleep);
+                if (ret < 0) {
+                        if (sleep)
+                                syslog(LOG_ERR, "Failed to put watchdog thread to sleep: %s\n", strerror(-ret));
+                        else
+                                syslog(LOG_ERR, "Failed to wake up watchdog thread: %s\n", strerror(-ret));
+
+                        assert_se(r = dbus_message_new_error_printf(m, translate_error_forward(ret), strerror(-ret)));
+                        goto finish;
+                }
+
+                assert_se(r = dbus_message_new_method_return(m));
+                assert_se(dbus_connection_send(c, r, NULL));
+                dbus_message_unref(r);
+                r = NULL;
         } else if (dbus_message_is_method_call(m, "org.freedesktop.DBus.Properties", "Get")) {
                 const char *interface, *property;
 
@@ -1544,8 +1592,14 @@ static void block_all_signals(void) {
 }
 
 static void* canary_thread(void *data) {
+        enum {
+                POLLFD_QUIT,
+                POLLFD_SLEEP,
+                _POLLFD_MAX,
+        };
         struct timespec last_cheep, now;
-        struct pollfd pollfd;
+        struct pollfd pollfd[_POLLFD_MAX];
+
 
         assert(canary_fd >= 0);
         assert(quit_fd >= 0);
@@ -1555,8 +1609,10 @@ static void* canary_thread(void *data) {
         self_drop_realtime(0);
 
         memset(&pollfd, 0, sizeof(pollfd));
-        pollfd.fd = quit_fd;
-        pollfd.events = POLLIN;
+        pollfd[POLLFD_QUIT].fd = quit_fd;
+        pollfd[POLLFD_QUIT].events = POLLIN;
+        pollfd[POLLFD_SLEEP].fd = sleep_fd;
+        pollfd[POLLFD_SLEEP].events = POLLIN;
 
         assert_se(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
         last_cheep = now;
@@ -1572,7 +1628,7 @@ static void* canary_thread(void *data) {
                 if (msec < 0)
                         msec = 0;
 
-                r = poll(&pollfd, 1, (int) msec);
+                r = poll(pollfd, _POLLFD_MAX, (int) msec);
 
                 assert_se(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
 
@@ -1584,9 +1640,30 @@ static void* canary_thread(void *data) {
                         break;
                 }
 
-                if (pollfd.revents) {
+                if (pollfd[POLLFD_QUIT].revents) {
                         syslog(LOG_DEBUG, "Exiting canary thread.\n");
                         break;
+                }
+
+                if (pollfd[POLLFD_SLEEP].revents) {
+                        eventfd_t value;
+
+                        r = poll(&pollfd[POLLFD_SLEEP], 1, -1);
+                        if (r < 0) {
+                                syslog(LOG_ERR, "poll() failed: %s\n", strerror(errno));
+                                break;
+                        }
+
+                        r = eventfd_read(sleep_fd, &value);
+                        if (r < 0 && errno != EAGAIN) {
+                                syslog(LOG_ERR, "eventfd_read() failed: %s\n", strerror(errno));
+                                break;
+                        }
+
+                        assert_se(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+                        last_cheep = now;
+
+                        continue;
                 }
 
                 if (TIMESPEC_MSEC(last_cheep) + canary_cheep_msec <= TIMESPEC_MSEC(now)) {
@@ -1609,7 +1686,8 @@ static void* watchdog_thread(void *data) {
         enum {
                 POLLFD_CANARY,
                 POLLFD_QUIT,
-                _POLLFD_MAX
+                POLLFD_SLEEP,
+                _POLLFD_MAX,
         };
         struct timespec last_cheep, now;
         struct pollfd pollfd[_POLLFD_MAX];
@@ -1624,8 +1702,12 @@ static void* watchdog_thread(void *data) {
         memset(pollfd, 0, sizeof(pollfd));
         pollfd[POLLFD_CANARY].fd = canary_fd;
         pollfd[POLLFD_CANARY].events = POLLIN;
+
         pollfd[POLLFD_QUIT].fd = quit_fd;
         pollfd[POLLFD_QUIT].events = POLLIN;
+
+        pollfd[POLLFD_SLEEP].fd = sleep_fd;
+        pollfd[POLLFD_SLEEP].events = POLLIN;
 
         assert_se(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
         last_cheep = now;
@@ -1666,6 +1748,26 @@ static void* watchdog_thread(void *data) {
                                 break;
                         }
 
+                        last_cheep = now;
+                        continue;
+                }
+
+                if (pollfd[POLLFD_SLEEP].revents) {
+                        eventfd_t value;
+
+                        r = poll(&pollfd[POLLFD_SLEEP], 1, -1);
+                        if (r < 0) {
+                                syslog(LOG_ERR, "poll() failed: %s\n", strerror(errno));
+                                break;
+                        }
+
+                        r = eventfd_read(sleep_fd, &value);
+                        if (r < 0 && errno != EAGAIN) {
+                                syslog(LOG_ERR, "eventfd_read() failed: %s\n", strerror(errno));
+                                break;
+                        }
+
+                        assert_se(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
                         last_cheep = now;
                         continue;
                 }
@@ -1726,7 +1828,8 @@ static int start_canary(void) {
                 return 0;
 
         if ((canary_fd = eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC)) < 0 ||
-            (quit_fd = eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC)) < 0) {
+            (quit_fd = eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC)) < 0 ||
+            (sleep_fd = eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC)) < 0) {
                 r = -errno;
                 syslog(LOG_ERR, "eventfd() failed: %s\n", strerror(errno));
                 goto fail;
