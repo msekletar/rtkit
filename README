@@ -33,7 +33,7 @@ NOTES:
 
         * Client authorization is verified with PolicyKit
 
-        RealtimeKit can also be used to hand outh high priority
+        RealtimeKit can also be used to hand out high priority
         scheduling (i.e. negative nice level) to user processes.
 
         In addition to this a-priori policy enforcement, RealtimeKit
@@ -45,11 +45,11 @@ NOTES:
         Acknowledgments section below.
 
         In its duty to manage real-time scheduling *securely*
-        RealtimeKit runs as unpriviliged user, and uses capabalities,
+        RealtimeKit runs as an unpriviliged user, and uses capabalities,
         resource limits and chroot() to minimize its security impact.
 
         RealtimeKit probably has little use in embedded or server use
-        cases, use RLIMIT_RTPRIO tehre instead.
+        cases, use RLIMIT_RTPRIO there instead.
 
 WHY:
         If processes that have real-time scheduling privileges enter a
@@ -118,14 +118,14 @@ CLIENTS:
 
         But of course add more appropriate error checking! Also,
         falling back to plain SCHED_RR when SCHED_RESET_ON_FORK causes
-        EINVAL migt be advisable).
+        EINVAL might be advisable).
 
 DAEMON:
 
         The daemon is automatically started on first use via D-Bus
         system bus activation.
 
-        Currently the daemon does not read on any configuration file,
+        Currently the daemon does not read any configuration file,
         however it can be configured with command line parameters. You
         can edit
 
@@ -164,7 +164,7 @@ DAEMON:
         will be delayed a bit.
 
         --rttime-usec-max= may be used to control which RLIMIT_RTTIME
-        value clients need to have chosen at minumum before they may
+        value clients need to have chosen at minimum before they may
         acquire RT scheduling through RealtimeKit.
 
         --users-max= specifies how many users may acquire RT
